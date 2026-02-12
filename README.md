@@ -1,33 +1,31 @@
 # WebMITM - Simulación Educativa de Intermediario
 
-⚠️ Este proyecto está destinado exclusivamente a fines educativos y de investigación de seguridad autorizada.
+⚠️ Este proyecto es únicamente para fines educativos y de investigación de seguridad autorizada.
 
 ---
 
 ## 📌 Descripción
 
-WebMITM es una herramienta de laboratorio controlado diseñada para demostrar cómo funcionan los conceptos de Intermediario (MITM) en entornos de análisis y estudio de seguridad informática.
+WebMITM es una herramienta de laboratorio diseñada para mostrar cómo funcionan los conceptos de Intermediario (MITM) en análisis de seguridad informática.  
+Permite a estudiantes e investigadores:
 
-El objetivo del proyecto es ayudar a estudiantes e investigadores a comprender:
-
-- Cómo funcionan los conceptos de interceptación de tráfico
-- Cómo pueden analizarse flujos HTTP en entornos controlados
-- Cómo se explotan configuraciones inseguras
-- Cómo implementar medidas defensivas adecuadas
+- Comprender la interceptación de tráfico
+- Analizar flujos HTTP en entornos controlados
+- Estudiar configuraciones inseguras
+- Explorar medidas defensivas
 
 ---
 
 ## ⚖️ Aviso Legal
 
-Este software SOLO debe utilizarse:
+Solo debe usarse en:
 
-- En entornos de laboratorio aislados
-- En sistemas de su propiedad
-- En sistemas con autorización escrita explícita
+- Laboratorios controlados
+- Sistemas propios
+- Sistemas con autorización explícita
 
-El uso no autorizado contra redes, dispositivos o personas reales es ilegal.
-
-El autor NO asume ninguna responsabilidad por el uso indebido ni por consecuencias legales derivadas de su utilización.
+El uso contra redes, dispositivos o personas reales es ilegal.  
+El autor no se responsabiliza por uso indebido.
 
 ---
 
@@ -41,4 +39,6 @@ El autor NO asume ninguna responsabilidad por el uso indebido ni por consecuenci
 ## 🚀 Uso Básico
 
 ```bash
+git clone https://github.com/dereeqw/web-mitm-lab.git
+cd web-mitm-lab
 python3 webmitm.py
