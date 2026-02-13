@@ -1,44 +1,70 @@
-# WebMITM - Simulación Educativa de Intermediario
+# WebMITM Lab - Framework de Investigación de Seguridad
 
-⚠️ Este proyecto es únicamente para fines educativos y de investigación de seguridad autorizada.
+[
+
+![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)
+
+](https://www.python.org/)
+[
+
+![Licencia](https://img.shields.io/badge/licencia-Educativa-green.svg)
+
+](LICESE)
+
+⚠️ **Solo para Fines Educativos e Investigación de Seguridad Autorizada**
 
 ---
 
 ## 📌 Descripción
 
-WebMITM es una herramienta de laboratorio diseñada para mostrar cómo funcionan los conceptos de Intermediario (MITM) en análisis de seguridad informática.  
-Permite a estudiantes e investigadores:
+WebMITM Lab es un framework educativo diseñado para demostrar conceptos de ataques Man-in-the-Middle (MITM) en entrenamiento de ciberseguridad e investigación en entornos controlados.
 
-- Comprender la interceptación de tráfico
-- Analizar flujos HTTP en entornos controlados
-- Estudiar configuraciones inseguras
-- Explorar medidas defensivas
-
----
-
-## ⚖️ Aviso Legal
-
-Solo debe usarse en:
-
-- Laboratorios controlados
-- Sistemas propios
-- Sistemas con autorización explícita
-
-El uso contra redes, dispositivos o personas reales es ilegal.  
-El autor no se responsabiliza por uso indebido.
+### Propósito
+Este toolkit ayuda a profesionales de seguridad, estudiantes e investigadores a comprender:
+- Técnicas de interceptación de tráfico
+- Análisis de flujos HTTP/HTTPS
+- Identificación de configuraciones inseguras
+- Medidas de seguridad defensiva
 
 ---
 
-## 🛠 Requisitos
+## 🎓 Casos de Uso Educativos
+
+**Apropiado para:**
+- ✅ Cursos universitarios de ciberseguridad
+- ✅ Certificaciones profesionales de seguridad (CEH, OSCP, GPEN)
+- ✅ Entrenamiento de concientización de seguridad corporativa
+- ✅ Evaluaciones de penetración autorizadas
+- ✅ Ejercicios de red team en entornos aislados
+- ✅ Investigación académica de seguridad
+
+---
+
+## 🛠 Características
+
+### webmitm.py - Proxy Transparente
+- Demostración de interceptación de tráfico en tiempo real
+- Capacidades de análisis de sesiones
+- Captura de cookies y tokens para análisis educativo
+- Gestión de sesiones multi-cliente
+
+### webclon.py - Simulador de Clonación Web
+- Replicación de sitios web para propósitos de entrenamiento
+- Demostración de captura de datos de formularios
+- Entrenamiento de concientización sobre robo de credenciales
+- Educación sobre técnicas de phishing
+
+---
+
+## 📋 Requisitos
 
 - Python 3.x
-- Dependencias necesarias
+- pip (gestor de paquetes de Python)
+- Entorno de laboratorio aislado
 
----
-
-## 🚀 Uso Básico
-
+**Dependencias** (se instalan automáticamente):
 ```bash
-git clone https://github.com/dereeqw/web-mitm-lab.git
-cd web-mitm-lab
-python3 webmitm.py
+requests
+beautifulsoup4
+flask
+lxml
