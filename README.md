@@ -1,13 +1,15 @@
 # WebMITM Lab - Framework de Investigación de Seguridad
 
+[
 
 ![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)
 
-(https://www.python.org/)
+](https://www.python.org/)
+[
 
 ![Licencia](https://img.shields.io/badge/licencia-Educativa-green.svg)
 
-(LICESE)
+](LICESE)
 
 ⚠️ **Solo para Fines Educativos e Investigación de Seguridad Autorizada**
 
@@ -57,12 +59,13 @@ Este toolkit ayuda a profesionales de seguridad, estudiantes e investigadores a 
 ## 📋 Requisitos
 
 - Python 3.x
-- pip (gestor de paquetes de Python)
-- Entorno de laboratorio aislado
+- Dependencias necesarias (se instalan automáticamente)
 
-**Dependencias** (se instalan automáticamente):
+---
+
+## 🚀 Instalación
+
 ```bash
-requests
-beautifulsoup4
-flask
-lxml
+git clone https://github.com/dereeqw/web-mitm-lab.git
+cd web-mitm-lab
+python3 webmitm.py
