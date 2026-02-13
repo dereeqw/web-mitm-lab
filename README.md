@@ -1,15 +1,6 @@
 # WebMITM Lab - Framework de Investigación de Seguridad
 
-[
-
-![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)
-
-](https://www.python.org/)
-[
-
-![Licencia](https://img.shields.io/badge/licencia-Educativa-green.svg)
-
-](LICESE)
+**Python 3.x** | **Licencia Educativa** | [Ver Licencia](LICESE)
 
 ⚠️ **Solo para Fines Educativos e Investigación de Seguridad Autorizada**
 
