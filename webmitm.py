@@ -103,7 +103,7 @@ class MITMProxy:
         self.redirects       = {}
         # One-time (polling): ip → (url, used)
         self.one_redirects   = {}
-        # Siguiente request real (NO polling): disparado en _handle()
+        # Siguiente request: disparado en _handle()
         self.next_redirect   = None
 
         # Capturas
@@ -208,7 +208,6 @@ class MITMProxy:
             }
 
             # Crear sesión temporal limpia para el sitio externo
-            # (no mezclamos cookies del target original)
             ext_sess_key = f"__open__{ip}__{ext_host}"
             if ext_sess_key not in self.sessions:
                 s = requests.Session()
