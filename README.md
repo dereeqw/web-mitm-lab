@@ -4,6 +4,7 @@
 
 ⚠️ **Solo para Fines Educativos e Investigación de Seguridad Autorizada**
 
+![BlackBerryC2 Demo](webmitm_v3_Demo.gif)
 ---
 
 ## 📌 Descripción
